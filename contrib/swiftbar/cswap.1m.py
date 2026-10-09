@@ -13,9 +13,10 @@
 The title draws the active account's windows as stacked mini bars with
 their percentages. The dropdown lists every managed account with full bars
 and reset countdowns, like ``cswap watch``; clicking another account
-switches to it. A Settings submenu mirrors ``cswap menubar``'s: what the
-title shows, the refresh interval, and the auto-switcher (``cswap auto``,
-kept running by a launchd agent).
+switches to it. The rest mirrors ``cswap menubar``: switch strategies,
+adding, disabling and removing accounts, switch history, and Settings for
+what the title shows, the refresh interval, and the auto-switcher
+(``cswap auto``, kept running by a launchd agent).
 
 It only drives the ``cswap`` command line, so it needs nothing beyond the
 Python standard library and runs on the macOS system ``python3`` (3.9).
@@ -28,6 +29,7 @@ import base64
 import json
 import os
 import plistlib
+import re
 import shutil
 import struct
 import subprocess
@@ -84,6 +86,10 @@ _TOGGLES = ("show_account_name", "title_reset")
 BACKUP_DIR = Path.home() / ".claude-swap-backup"
 SETTINGS_PATH = BACKUP_DIR / "swiftbar_settings.json"
 LEGACY_SETTINGS_PATH = BACKUP_DIR / "menubar_settings.json"
+
+LOG_PATH = BACKUP_DIR / "claude-swap.log"
+SWITCH_HISTORY_LIMIT = 10
+SWITCH_STRATEGIES = (("rotate", "Rotate to next"), ("best", "Switch to best"), ("next-available", "Next available"))
 
 AUTO_LABEL = "com.cswap.auto"
 AUTO_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{AUTO_LABEL}.plist"
@@ -270,9 +276,137 @@ def set_threshold(cswap: str, pct: int) -> None:
         )
 
 
+# -- account actions -----------------------------------------------------------
+# Menu clicks run outside any terminal, so results and errors surface through
+# macOS notifications and dialogs, like cswap menubar's.
+
+
+def _osascript(lines: list[str], *argv: str) -> subprocess.CompletedProcess:
+    """Run AppleScript with values passed as ``argv`` (never spliced into code)."""
+    script = ["on run argv"] + lines + ["end run"]
+    cmd = ["/usr/bin/osascript"] + [part for line in script for part in ("-e", line)] + list(argv)
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def notify(title: str, message: str) -> None:
+    _osascript(['display notification (item 2 of argv) with title "claude-swap" subtitle (item 1 of argv)'],
+               title, message)
+
+
+def alert(message: str) -> None:
+    _osascript(["activate", 'display alert "claude-swap" message (item 1 of argv) as warning'], message)
+
+
+def confirm(message: str, button: str) -> bool:
+    proc = _osascript(
+        ["activate",
+         'display dialog (item 1 of argv) buttons {"Cancel", item 2 of argv} default button "Cancel" '
+         'cancel button "Cancel" with title "claude-swap" with icon caution'],
+        message, button,
+    )
+    return proc.returncode == 0
+
+
+def ask(prompt: str, hidden: bool = False) -> str | None:
+    """A text prompt; None when cancelled or left empty."""
+    hide = " with hidden answer" if hidden else ""
+    proc = _osascript(
+        ["activate",
+         f'text returned of (display dialog (item 1 of argv) default answer "" with title "claude-swap"{hide})'],
+        prompt,
+    )
+    text = proc.stdout.strip()
+    return text if proc.returncode == 0 and text else None
+
+
+def _last_line(proc: subprocess.CompletedProcess) -> str:
+    for stream in (proc.stderr, proc.stdout):
+        lines = [l for l in re.sub(r"\x1b\[[0-9;]*m", "", stream or "").splitlines() if l.strip()]
+        if lines:
+            return lines[-1].strip()
+    return f"cswap exited with {proc.returncode}"
+
+
+def run_cswap(cswap: str, *args: str, stdin: str | None = None) -> bool:
+    """Run a mutating cswap command; show its error in a dialog when it fails."""
+    # An empty stdin makes any unexpected prompt fail fast instead of hanging.
+    proc = subprocess.run(
+        [cswap, *args], input=stdin or "", capture_output=True, text=True, timeout=120
+    )
+    if proc.returncode != 0:
+        alert(_last_line(proc))
+        return False
+    return True
+
+
+def notify_switched(cswap: str) -> None:
+    try:
+        active = next(a for a in load_accounts(cswap)["accounts"] if a.get("active"))
+        title = f"Now on account {active.get('number')} ({active.get('email')})"
+    except (RuntimeError, OSError, StopIteration, subprocess.TimeoutExpired):
+        title = "Account switched"
+    notify(title, "Takes effect within ~30s; restart Claude Code to apply immediately.")
+
+
+def switch_history(log_path: Path | None = None, limit: int = SWITCH_HISTORY_LIMIT) -> list[str]:
+    """Recent switches from cswap's log, newest first (``2 → 1   2026-10-09 11:56``)."""
+    try:
+        with (log_path or LOG_PATH).open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 512 * 1024))  # the log only grows; read its tail
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        m = re.search(r"Switched from account (\S+) to (\S+)", line)
+        if m:
+            out.append(f"{m.group(1)} → {m.group(2)}   {line.split(' - ', 1)[0].strip()[:16]}")
+    return out[-limit:][::-1]
+
+
+def account_action(action: str, rest: list[str], cswap: str) -> int | None:
+    """Account menu clicks; None when ``action`` is not one of them."""
+    if action == "switch" and len(rest) == 1:
+        if run_cswap(cswap, "switch", rest[0]):
+            notify_switched(cswap)
+    elif action == "switch-strategy" and len(rest) == 1 and rest[0] in dict(SWITCH_STRATEGIES):
+        args = ["switch"] if rest[0] == "rotate" else ["switch", "--strategy", rest[0]]
+        if run_cswap(cswap, *args):
+            notify_switched(cswap)
+    elif action == "add-login" and not rest:
+        # Adds the account Claude Code is logged in to, or refreshes its stored
+        # credentials when it is already managed.
+        if run_cswap(cswap, "add"):
+            notify("Current login saved", "Log in to another account in Claude Code and add it the same way.")
+    elif action == "add-token" and not rest:
+        email = ask("Email for this token:")
+        token = email and ask("Setup token (sk-ant-oat01-…):", hidden=True)
+        if token and run_cswap(cswap, "add-token", "-", "--email", email, stdin=token + "\n"):
+            notify("Account added", email)
+    elif action in ("disable", "enable") and len(rest) == 1:
+        run_cswap(cswap, action, rest[0])
+    elif action == "remove" and len(rest) == 2:
+        number, email = rest
+        if confirm(f"Permanently remove account {number} ({email})?", "Remove"):
+            # cswap asks again on stdin; this dialog already confirmed it.
+            run_cswap(cswap, "remove", number, stdin="y\n")
+    elif action == "open-log" and not rest:
+        target = LOG_PATH if LOG_PATH.exists() else LOG_PATH.parent
+        subprocess.run(["/usr/bin/open", "-R", str(target)], capture_output=True)
+    else:
+        return None
+    return 0
+
+
 def run_action(args: list[str], plugin_path: str, cswap: str | None) -> int:
-    """Handle a menu click: ``set KEY VALUE``, ``interval``, ``auto``, ``threshold``."""
+    """Handle a menu click: settings (``set``, ``interval``, ``auto``,
+    ``threshold``) or an account action (see ``account_action``)."""
     action, rest = args[0], args[1:]
+    if cswap is not None:
+        handled = account_action(action, rest, cswap)
+        if handled is not None:
+            return handled
     if action == "set" and len(rest) == 2:
         key, value = rest
         settings = load_settings()
@@ -522,7 +656,7 @@ def command(program: str, *args: object, refresh: bool = True) -> str:
     return out + (" refresh=true" if refresh else "")
 
 
-def account_card(acc: dict, cswap: str, track: int, now: float) -> list[str]:
+def account_card(acc: dict, plugin_path: str, track: int, now: float) -> list[str]:
     """The active account reads in the normal menu color; the others are muted.
 
     Every line carries an action: SwiftBar draws an actionless line disabled
@@ -550,7 +684,7 @@ def account_card(acc: dict, cswap: str, track: int, now: float) -> list[str]:
         action = "refresh=true"
     else:
         header += "  " + fg(ANSI_MUTED, "› switch")
-        action = command(cswap, "switch", number) + f' tooltip="Switch to account {number}"'
+        action = command(plugin_path, "switch", number) + f' tooltip="Switch to account {number}"'
     lines = [f"{header} | {ROW} {action}"]
 
     windows = usage_windows(usage, now)
@@ -613,6 +747,46 @@ def settings_menu(
     return lines
 
 
+def accounts_menu(accounts: list[dict], plugin_path: str) -> list[str]:
+    """cswap menubar's switch strategies, account management and history."""
+    lines = [f"{label} | {command(plugin_path, 'switch-strategy', key)}" for key, label in SWITCH_STRATEGIES]
+    lines.append("---")
+    lines.append("Add account")
+    lines.append(f"--From current login | {command(plugin_path, 'add-login')}"
+                 ' tooltip="Adds the account Claude Code is logged in to"')
+    lines.append(f"--From setup-token… | {command(plugin_path, 'add-token')}")
+
+    def account_label(acc: dict) -> str:
+        email = clean(acc.get("email", "?"))
+        name = f"{clean(acc['alias'])}  ({email})" if acc.get("alias") else email
+        return f"{acc.get('number')}  {name}"
+
+    numbered = [a for a in accounts if a.get("number") is not None]
+    disable_items, remove_items = [], []
+    for acc in numbered:
+        # A check mark means held out of auto-rotation, as in cswap menubar.
+        disabled = bool(acc.get("disabled"))
+        toggle = command(plugin_path, "enable" if disabled else "disable", acc["number"])
+        disable_items.append(f"--{account_label(acc)} | {toggle}" + (" checked=true" if disabled else ""))
+        remove = command(plugin_path, "remove", acc["number"], clean(acc.get("email", "?")))
+        remove_items.append(f"--{account_label(acc)} | {remove}")
+    lines.append("Disable / enable account")
+    lines.extend(disable_items or ["--No managed accounts"])
+    lines.append("Remove account")
+    lines.extend(remove_items or ["--No managed accounts"])
+    lines.append(f"Refresh current credentials | {command(plugin_path, 'add-login')}"
+                 ' tooltip="Saves the current Claude Code login over its stored copy"')
+
+    lines.append("Switch history")
+    history = switch_history()
+    lines.extend(f"--{entry}" for entry in history)
+    if not history:
+        lines.append("--No switches logged yet")
+    lines.append("-----")
+    lines.append(f"--Open full log… | {command(plugin_path, 'open-log', refresh=False)}")
+    return lines
+
+
 def render(
     payload: dict,
     cswap: str,
@@ -635,7 +809,9 @@ def render(
         lines.append("Claude accounts · click one to switch | size=11 color=#8a8a8a")
         for acc in sorted(accounts, key=lambda a: (a.get("number") is None, a.get("number") or 0)):
             lines.append("---")
-            lines.extend(account_card(acc, cswap, track, now))
+            lines.extend(account_card(acc, plugin_path, track, now))
+    lines.append("---")
+    lines.extend(accounts_menu(accounts, plugin_path))
     lines.append("---")
     models = model_names(accounts, settings["title_limits"])
     lines.extend(settings_menu(settings, plugin_path, threshold, auto_on, models))

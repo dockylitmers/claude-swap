@@ -143,7 +143,7 @@ def test_cards_are_in_number_order_and_others_switch_on_click(plugin):
     assert active[0].startswith("2  john.doe@gmail.com")
     assert other[0].startswith(f"{MUTED}3  john.doe@company.com")
     assert all("refresh=true" in l and "bash=" not in l for l in active)
-    assert all("bash=/bin/cswap param1=switch param2=3" in l for l in other)
+    assert all(f'bash="{LINK}" param1=switch param2=3' in l for l in other)
 
 
 def test_active_account_reads_normal_and_others_muted(plugin):
@@ -259,3 +259,92 @@ def test_unavailable_account_falls_back_to_last_known_reading(plugin):
 def test_no_accounts_points_at_cswap_add(plugin):
     lines = _render(plugin, {"accounts": []})
     assert lines[:3] == ["⇄ | emojize=false symbolize=false", "---", "No managed accounts. Run: cswap add"]
+
+
+FAKE_CSWAP = """#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+log = Path(__file__).with_name("calls.jsonl")
+with log.open("a") as fh:
+    fh.write(json.dumps({"args": sys.argv[1:], "stdin": "" if sys.stdin.isatty() else sys.stdin.read()}) + "\\n")
+if sys.argv[1:] == ["list", "--json"]:
+    print(json.dumps({"accounts": [{"number": 1, "email": "a@example.com", "active": True}]}))
+sys.exit(3 if "fail" in sys.argv else 0)
+"""
+
+
+@pytest.fixture()
+def fake_cswap(plugin, tmp_path, monkeypatch):
+    exe = tmp_path / "cswap"
+    exe.write_text(FAKE_CSWAP)
+    exe.chmod(0o755)
+    ui = {"notify": [], "alert": [], "confirm": True, "ask": []}
+    monkeypatch.setattr(plugin, "notify", lambda title, msg: ui["notify"].append(title))
+    monkeypatch.setattr(plugin, "alert", lambda msg: ui["alert"].append(msg))
+    monkeypatch.setattr(plugin, "confirm", lambda msg, button: ui["confirm"])
+    monkeypatch.setattr(plugin, "ask", lambda prompt, hidden=False: ui["ask"].pop(0) if ui["ask"] else None)
+
+    def calls():
+        log = tmp_path / "calls.jsonl"
+        return [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+
+    return str(exe), ui, calls
+
+
+def test_accounts_menu_mirrors_cswap_menubar(plugin, tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin, "LOG_PATH", tmp_path / "missing.log")
+    payload = _payload()
+    payload["accounts"][0]["disabled"] = True
+    lines = plugin.accounts_menu(payload["accounts"], LINK)
+    labels = [l.split(" | ")[0] for l in lines]
+    assert labels[:3] == ["Rotate to next", "Switch to best", "Next available"]
+    assert "--From current login" in labels and "--From setup-token…" in labels
+    disable = next(l for l in lines if l.startswith("--3  Work  (john.doe@company.com)") and "enable" in l)
+    assert "param1=enable param2=3" in disable and "checked=true" in disable
+    remove = [l for l in lines if "param1=remove" in l]
+    assert "param2=3 param3=john.doe@company.com" in remove[0]
+    assert "--No switches logged yet" in labels
+
+
+def test_switch_history_reads_newest_first(plugin, tmp_path):
+    log = tmp_path / "claude-swap.log"
+    log.write_text(
+        "2026-09-28 09:46:15,862 - INFO - Switched from account 2 to 1\n"
+        "2026-10-09 11:56:17,063 - INFO - Backed up account 2\n"
+        "2026-10-09 11:56:17,157 - INFO - Switched from account 1 to 2\n"
+    )
+    assert plugin.switch_history(log) == ["1 → 2   2026-10-09 11:56", "2 → 1   2026-09-28 09:46"]
+
+
+def test_switch_runs_cswap_and_notifies(plugin, fake_cswap):
+    cswap, ui, calls = fake_cswap
+    assert plugin.run_action(["switch", "2"], LINK, cswap) == 0
+    assert plugin.run_action(["switch-strategy", "best"], LINK, cswap) == 0
+    args = [c["args"] for c in calls()]
+    assert ["switch", "2"] in args and ["switch", "--strategy", "best"] in args
+    assert ui["notify"] == ["Now on account 1 (a@example.com)"] * 2
+
+
+def test_failed_command_shows_an_alert_and_no_notification(plugin, fake_cswap):
+    cswap, ui, _calls = fake_cswap
+    assert plugin.run_action(["switch", "fail"], LINK, cswap) == 0
+    assert ui["alert"] == ["cswap exited with 3"] and ui["notify"] == []
+
+
+def test_add_token_passes_the_token_on_stdin(plugin, fake_cswap):
+    cswap, ui, calls = fake_cswap
+    ui["ask"] = ["me@example.com", "sk-ant-oat01-secret"]
+    plugin.run_action(["add-token"], LINK, cswap)
+    call = calls()[-1]
+    assert call["args"] == ["add-token", "-", "--email", "me@example.com"]
+    assert call["stdin"] == "sk-ant-oat01-secret\n"
+
+
+def test_remove_needs_the_dialog_confirmation(plugin, fake_cswap):
+    cswap, ui, calls = fake_cswap
+    ui["confirm"] = False
+    plugin.run_action(["remove", "2", "b@example.com"], LINK, cswap)
+    assert calls() == []
+    ui["confirm"] = True
+    plugin.run_action(["remove", "2", "b@example.com"], LINK, cswap)
+    assert calls()[-1] == {"args": ["remove", "2"], "stdin": "y\n"}

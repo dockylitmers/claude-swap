@@ -4,6 +4,7 @@ Usage bars for every claude-swap account in the macOS menu bar, drawn with [Swif
 
 - **Menu bar:** the active account's windows as stacked mini bars with their percentages. Bars turn amber at 70% and red at 90%, the same bands as `cswap watch`.
 - **Dropdown:** every managed account with full-width bars and reset countdowns. The active account reads in the normal menu color and the others are muted. Click another account to switch to it (`cswap switch <num>`). *Open live dashboard* runs `cswap watch` in your terminal.
+- **Accounts:** the rest of `cswap menubar`'s menu. *Rotate to next*, *Switch to best* and *Next available* run `cswap switch` with each strategy. *Add account* takes the current Claude Code login (`cswap add`) or a setup-token (`cswap add-token`, entered in a dialog). There are also *Disable / enable account*, *Remove account* (asks first), *Refresh current credentials* and *Switch history*. A switch posts a notification, and a failed command shows its error in a dialog.
 - **Settings:** the same choices as `cswap menubar`, plus a title style and reset times.
 
 | Setting | What it does |
