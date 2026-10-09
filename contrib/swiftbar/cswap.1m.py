@@ -62,18 +62,22 @@ STALE_AFTER_S = 120
 ROW = "font=Menlo size=12 ansi=true trim=false emojize=false symbolize=false"
 TITLE = "emojize=false symbolize=false"
 
-# Settings, with cswap menubar's labels and choices.
-TITLE_PCT_CHOICES = (("off", "None"), ("5h", "Session (5h)"), ("7d", "Weekly (7d)"), ("both", "Both (5h · 7d)"))
+# Settings. "title_limits" names the windows the title shows: "5h", "7d" and
+# per-model names such as "Fable"; "models" stands for every model (what
+# cswap menubar's "Show model limits in title" meant).
 TITLE_STYLE_CHOICES = (("both", "Bars and numbers"), ("bars", "Bars only"), ("numbers", "Numbers only"))
 REFRESH_CHOICES = (("30s", "30 seconds"), ("1m", "60 seconds"), ("5m", "5 minutes"))
 AUTO_THRESHOLD_CHOICES = (80, 90, 95, 98)
+ACCOUNT_LIMITS = (("5h", "Session (5h)"), ("7d", "Weekly (7d)"))
+ALL_MODELS = "models"
 DEFAULT_SETTINGS = {
     "show_account_name": True,
-    "title_pct": "both",
-    "title_scoped": False,
+    "title_limits": ["5h", "7d"],
     "title_style": "both",
+    "title_reset": False,
 }
-_CHOICES = {"title_pct": TITLE_PCT_CHOICES, "title_style": TITLE_STYLE_CHOICES}
+_CHOICES = {"title_style": TITLE_STYLE_CHOICES}
+_TOGGLES = ("show_account_name", "title_reset")
 
 # cswap's backup root on macOS. menubar_settings.json is cswap menubar's own
 # display settings, read as the starting values.
@@ -139,6 +143,15 @@ def load_accounts(cswap: str) -> dict:
 # -- settings ----------------------------------------------------------------
 
 
+def _legacy_limits(data: dict) -> list[str] | None:
+    """cswap menubar's title_pct/title_scoped pair as a title_limits list."""
+    pct, scoped = data.get("title_pct"), data.get("title_scoped")
+    if pct not in ("off", "5h", "7d", "both") and not isinstance(scoped, bool):
+        return None
+    limits = {"5h": ["5h"], "7d": ["7d"], "both": ["5h", "7d"]}.get(pct, [])
+    return limits + ([ALL_MODELS] if scoped else [])
+
+
 def load_settings(path: Path | None = None, legacy: Path | None = None) -> dict:
     """Defaults, overlaid by cswap menubar's settings, then by our own."""
     settings = dict(DEFAULT_SETTINGS)
@@ -151,6 +164,12 @@ def load_settings(path: Path | None = None, legacy: Path | None = None) -> dict:
             continue
         for key, default in DEFAULT_SETTINGS.items():
             value = data.get(key)
+            if key == "title_limits":
+                if not (isinstance(value, list) and all(isinstance(v, str) for v in value)):
+                    value = _legacy_limits(data)
+                if value is not None:
+                    settings[key] = value
+                continue
             if type(value) is not type(default):
                 continue
             if key in _CHOICES and value not in dict(_CHOICES[key]):
@@ -257,8 +276,11 @@ def run_action(args: list[str], plugin_path: str, cswap: str | None) -> int:
     if action == "set" and len(rest) == 2:
         key, value = rest
         settings = load_settings()
-        if key in ("show_account_name", "title_scoped") and value == "toggle":
+        if key in _TOGGLES and value == "toggle":
             settings[key] = not settings[key]
+        elif key == "title_limits":
+            # The menu passes the whole resulting list; "none" is empty.
+            settings[key] = [] if value == "none" else [v for v in value.split(",") if v]
         elif key in _CHOICES and value in dict(_CHOICES[key]):
             settings[key] = value
         else:
@@ -411,6 +433,28 @@ def _local_part(email: str, limit: int = 12) -> str:
     return local[: limit - 1] + "*" if len(local) > limit else local
 
 
+def _limit_key(w: Window) -> str:
+    return w.label if w.kind == "model" else w.kind
+
+
+def _limit_selected(limits: list[str], w: Window) -> bool:
+    if w.kind == "spend":
+        return False
+    return _limit_key(w) in limits or (w.kind == "model" and ALL_MODELS in limits)
+
+
+def model_names(accounts: list[dict], limits: list[str]) -> list[str]:
+    """Per-model limits any account reports, plus ones already selected."""
+    names: list[str] = []
+    for acc in accounts:
+        usage, _age = _account_usage(acc)
+        for raw in (usage.get("scoped") or []) if isinstance(usage, dict) else []:
+            if isinstance(raw, dict) and raw.get("name") and str(raw["name"]) not in names:
+                names.append(str(raw["name"]))
+    account_keys = dict(ACCOUNT_LIMITS)
+    return names + [l for l in limits if l not in names and l not in account_keys and l != ALL_MODELS]
+
+
 def title_line(accounts: list[dict], settings: dict, now: float) -> str:
     active = next((a for a in accounts if a.get("active")), None)
     if active is None:
@@ -424,13 +468,16 @@ def title_line(accounts: list[dict], settings: dict, now: float) -> str:
     if not windows:
         return f"{' · '.join(texts + ['!']) if texts else ICON + ' !'} | {TITLE}"
 
-    kinds = {"off": (), "5h": ("5h",), "7d": ("7d",), "both": ("5h", "7d")}[settings["title_pct"]]
-    if settings["title_scoped"]:
-        kinds += ("model",)
-    shown = [w for w in windows if w.kind in kinds]
+    shown = [w for w in windows if _limit_selected(settings["title_limits"], w)]
     style = settings["title_style"]
-    if style != "bars":
-        texts += [f"{w.label} {w.pct:.0f}%" if w.kind == "model" else f"{w.pct:.0f}%" for w in shown]
+    for w in shown:
+        parts = []
+        if style != "bars":
+            parts.append(f"{w.pct:.0f}%")
+        if settings["title_reset"] and w.countdown:
+            parts.append(w.countdown.replace(" ", ""))  # "3h 52m" -> "3h52m"
+        if parts:
+            texts.append(" ".join([w.label] + parts if w.kind == "model" else parts))
     text = " · ".join(texts)
     if style != "numbers" and shown:
         image = base64.b64encode(title_image([w.pct for w in shown[:TITLE_MAX_BARS]])).decode("ascii")
@@ -528,7 +575,7 @@ def account_card(acc: dict, cswap: str, track: int, now: float) -> list[str]:
 
 
 def settings_menu(
-    settings: dict, plugin_path: str, threshold: float | None, auto_on: bool
+    settings: dict, plugin_path: str, threshold: float | None, auto_on: bool, models: list[str]
 ) -> list[str]:
     def item(label: str, checked: bool, *args: object, depth: int = 1, refresh: bool = True) -> str:
         mark = " checked=true" if checked else ""
@@ -538,13 +585,23 @@ def settings_menu(
     lines = ["Settings"]
     lines.append(item("Show account name in menu bar", settings["show_account_name"],
                       "set", "show_account_name", "toggle"))
-    lines.append("--Title percentage")
-    for value, label in TITLE_PCT_CHOICES:
-        lines.append(item(label, settings["title_pct"] == value, "set", "title_pct", value, depth=2))
-    lines.append(item("Show model limits in title", settings["title_scoped"], "set", "title_scoped", "toggle"))
+
+    # Each limit toggles independently; its action carries the resulting list.
+    choices = list(ACCOUNT_LIMITS) + [(name, f"{name} (weekly)") for name in models]
+    limits = settings["title_limits"]
+    selected = [key for key, _label in choices
+                if key in limits or (key in models and ALL_MODELS in limits)]
+    lines.append("--Limits in menu bar")
+    for key, label in choices:
+        on = key in selected
+        after = [k for k, _label in choices if (k in selected) != (k == key)]
+        lines.append(item(label, on, "set", "title_limits", ",".join(after) or "none", depth=2))
+
     lines.append("--Title style")
     for value, label in TITLE_STYLE_CHOICES:
         lines.append(item(label, settings["title_style"] == value, "set", "title_style", value, depth=2))
+    lines.append("----" + "---")  # separator inside the Title style submenu
+    lines.append(item("Show reset time", settings["title_reset"], "set", "title_reset", "toggle", depth=2))
     lines.append("--Refresh interval")
     for value, label in REFRESH_CHOICES:
         # No refresh: the rename makes SwiftBar reload the plugin anyway.
@@ -580,7 +637,8 @@ def render(
             lines.append("---")
             lines.extend(account_card(acc, cswap, track, now))
     lines.append("---")
-    lines.extend(settings_menu(settings, plugin_path, threshold, auto_on))
+    models = model_names(accounts, settings["title_limits"])
+    lines.extend(settings_menu(settings, plugin_path, threshold, auto_on, models))
     lines.append(f"Open live dashboard (cswap watch) | bash={_param(cswap)} param1=watch terminal=true")
     return lines
 

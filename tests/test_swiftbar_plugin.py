@@ -168,24 +168,46 @@ def test_title_follows_settings(plugin):
     title = _render(plugin, settings=settings)[0]
     assert title.startswith("76% · 13% | image=") and _title_bars(title) == 2
 
-    settings.update(title_scoped=True, title_style="numbers")
+    settings.update(title_limits=["5h", "7d", "Fable"], title_style="numbers")
     assert _render(plugin, settings=settings)[0].startswith("76% · 13% · Fable 59% | emojize")
 
-    settings.update(title_pct="5h", title_scoped=False, title_style="bars", show_account_name=True)
+    settings.update(title_limits=["5h"], title_style="bars", show_account_name=True)
     title = _render(plugin, settings=settings)[0]
     assert title.startswith("john.doe | image=") and _title_bars(title) == 1
 
-    settings.update(title_pct="off")
+    settings.update(title_limits=[])
     assert _render(plugin, settings=settings)[0].startswith("john.doe | emojize")
+
+
+def test_title_can_show_reset_times(plugin):
+    settings = dict(plugin.DEFAULT_SETTINGS, show_account_name=False, title_limits=["5h"], title_reset=True)
+    title = _render(plugin, settings=settings)[0]
+    assert title.startswith("76% 2h47m | image=") and _title_bars(title) == 1
+
+    settings.update(title_limits=["5h", "Fable"], title_style="bars")
+    assert _render(plugin, settings=settings)[0].startswith("2h47m · Fable 5d3h | image=")
 
 
 def test_settings_menu_marks_current_choices(plugin):
     lines = _render(plugin, threshold=90.0, auto_on=True)
     checked = [l.split(" | ")[0].lstrip("-") for l in lines if "checked=true" in l]
-    assert checked == ["Show account name in menu bar", "Both (5h · 7d)", "Bars and numbers",
-                       "60 seconds", "Auto-switch accounts", "90%"]
+    assert checked == ["Show account name in menu bar", "Session (5h)", "Weekly (7d)",
+                       "Bars and numbers", "60 seconds", "Auto-switch accounts", "90%"]
     auto = next(l for l in lines if l.startswith("--Auto-switch accounts"))
     assert 'bash="' + LINK + '" param1=auto param2=off' in auto
+    # Inside a level-2 submenu, a separator needs two "--" prefixes.
+    assert "-------" in lines
+
+
+def test_limit_items_toggle_one_limit_each(plugin):
+    settings = dict(plugin.DEFAULT_SETTINGS, title_limits=["5h", "models"])
+    lines = _render(plugin, settings=settings)
+    items = {l.split(" | ")[0]: l for l in lines if "param2=title_limits" in l}
+    assert list(items) == ["----Session (5h)", "----Weekly (7d)", "----Fable (weekly)"]
+    assert "checked=true" in items["----Fable (weekly)"]
+    assert "param3=Fable" in items["----Session (5h)"]
+    assert "param3=5h,7d,Fable" in items["----Weekly (7d)"]
+    assert "param3=5h " in items["----Fable (weekly)"]
 
 
 def test_settings_start_from_cswap_menubar_and_round_trip(plugin):
@@ -193,13 +215,16 @@ def test_settings_start_from_cswap_menubar_and_round_trip(plugin):
         {"show_account_name": False, "title_pct": "7d", "title_scoped": True, "refresh_interval": 300}
     ))
     assert plugin.load_settings() == {
-        "show_account_name": False, "title_pct": "7d", "title_scoped": True, "title_style": "both",
+        "show_account_name": False, "title_limits": ["7d", "models"],
+        "title_style": "both", "title_reset": False,
     }
-    assert plugin.run_action(["set", "title_pct", "5h"], LINK, None) == 0
-    assert plugin.run_action(["set", "show_account_name", "toggle"], LINK, None) == 0
-    assert plugin.run_action(["set", "title_pct", "bogus"], LINK, None) == 2
+    assert plugin.run_action(["set", "title_limits", "5h"], LINK, None) == 0
+    assert plugin.run_action(["set", "title_reset", "toggle"], LINK, None) == 0
+    assert plugin.run_action(["set", "title_style", "bogus"], LINK, None) == 2
     settings = plugin.load_settings()
-    assert settings["title_pct"] == "5h" and settings["show_account_name"] is True
+    assert settings["title_limits"] == ["5h"] and settings["title_reset"] is True
+    assert plugin.run_action(["set", "title_limits", "none"], LINK, None) == 0
+    assert plugin.load_settings()["title_limits"] == []
 
 
 def test_interval_renames_the_plugin_link(plugin, tmp_path):
@@ -213,7 +238,7 @@ def test_interval_renames_the_plugin_link(plugin, tmp_path):
 def test_passed_reset_rolls_the_window_to_zero(plugin):
     payload = _payload()
     payload["accounts"][1]["usage"]["fiveHour"] = _window(76, -1, "")
-    settings = dict(plugin.DEFAULT_SETTINGS, show_account_name=False, title_pct="5h")
+    settings = dict(plugin.DEFAULT_SETTINGS, show_account_name=False, title_limits=["5h"])
     assert _render(plugin, payload, settings=settings)[0].startswith("0% | image=")
 
 

@@ -4,14 +4,13 @@ Usage bars for every claude-swap account in the macOS menu bar, drawn with [Swif
 
 - **Menu bar:** the active account's windows as stacked mini bars with their percentages. Bars turn amber at 70% and red at 90%, the same bands as `cswap watch`.
 - **Dropdown:** every managed account with full-width bars and reset countdowns. The active account reads in the normal menu color and the others are muted. Click another account to switch to it (`cswap switch <num>`). *Open live dashboard* runs `cswap watch` in your terminal.
-- **Settings:** the same choices as `cswap menubar`, plus a title style.
+- **Settings:** the same choices as `cswap menubar`, plus a title style and reset times.
 
 | Setting | What it does |
 |---|---|
 | Show account name in menu bar | Adds the active account's alias, or the start of its email |
-| Title percentage | Which account-wide windows the title shows: none, 5h, 7d or both |
-| Show model limits in title | Adds per-model weekly limits such as Fable |
-| Title style | Bars and numbers, bars only, or numbers only |
+| Limits in menu bar | Which limits the title shows, each on or off: Session (5h), Weekly (7d), and every per-model weekly limit an account reports, such as Fable |
+| Title style | Bars and numbers, bars only, or numbers only; *Show reset time* adds each limit's countdown (`45% 3h52m`) |
 | Refresh interval | 30 seconds, 60 seconds or 5 minutes |
 | Auto-switch accounts | Runs `cswap auto` in the background under launchd |
 | Auto-switch threshold | Sets `autoswitch.threshold` (80, 90, 95 or 98%) |
