@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
+import json
+import re
 import struct
 import zlib
 from datetime import datetime, timedelta, timezone
@@ -12,13 +15,17 @@ import pytest
 
 PLUGIN_PATH = Path(__file__).resolve().parents[1] / "contrib" / "swiftbar" / "cswap.1m.py"
 NOW = datetime(2026, 10, 9, 3, 0, tzinfo=timezone.utc)
+LINK = "/Users/me/Library/Application Support/SwiftBar/Plugins/cswap.1m.py"
+MUTED = "\x1b[38;5;245m"
 
 
-@pytest.fixture(scope="module")
-def plugin():
+@pytest.fixture()
+def plugin(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("cswap_swiftbar_plugin", PLUGIN_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "SETTINGS_PATH", tmp_path / "swiftbar_settings.json")
+    monkeypatch.setattr(module, "LEGACY_SETTINGS_PATH", tmp_path / "menubar_settings.json")
     return module
 
 
@@ -48,17 +55,34 @@ def _payload() -> dict:
             {
                 "number": 2,
                 "email": "john.doe@gmail.com",
-                "alias": "Personal",
                 "active": True,
                 "usageStatus": "ok",
                 "usage": {
                     "fiveHour": _window(76, 2.8, "2h 47m"),
+                    "sevenDay": _window(13, 120, "5d 0h"),
                     "scoped": [dict(_window(59, 123, "5d 3h"), name="Fable")],
                 },
                 "usageAgeSeconds": 10,
             },
         ],
     }
+
+
+def _render(plugin, payload=None, **kwargs) -> list[str]:
+    return plugin.render(payload or _payload(), "/bin/cswap", LINK, now=NOW.timestamp(), **kwargs)
+
+
+def _cards(lines: list[str]) -> list[list[str]]:
+    """Account cards: the blocks between separators that start with a number."""
+    blocks, block = [], []
+    for line in lines[1:]:
+        if line == "---":
+            blocks.append(block)
+            block = []
+        else:
+            block.append(line)
+    blocks.append(block)
+    return [b for b in blocks if b and re.sub(r"\x1b\[[0-9;]*m", "", b[0])[:1].isdigit()]
 
 
 def _decode_png(data: bytes) -> tuple[int, int, int]:
@@ -76,6 +100,23 @@ def _decode_png(data: bytes) -> tuple[int, int, int]:
         pos += 12 + length
     assert len(zlib.decompress(idat)) == height * (width * 4 + 1)
     return width, height, ppm
+
+
+def _title_bars(title: str) -> int:
+    """How many bars the title image draws (its rows with any ink)."""
+    if "image=" not in title:
+        return 0
+    data = base64.b64decode(title.split("image=")[1].split()[0])
+    width, height, _ = _decode_png(data)
+    pos, idat = 8, b""
+    while pos < len(data):
+        (length,) = struct.unpack(">I", data[pos : pos + 4])
+        if data[pos + 4 : pos + 8] == b"IDAT":
+            idat += data[pos + 8 : pos + 8 + length]
+        pos += 12 + length
+    raw, stride = zlib.decompress(idat), width * 4 + 1
+    inked = [any(raw[y * stride + 1 + x * 4 + 3] for x in range(width)) for y in range(height)]
+    return sum(1 for y in range(height) if inked[y] and (y == 0 or not inked[y - 1]))
 
 
 def test_severity_matches_tui_bands(plugin):
@@ -97,36 +138,87 @@ def test_title_image_is_a_retina_png(plugin):
     assert ppm == round(144 / 0.0254)
 
 
-def test_render_lists_accounts_in_number_order_with_switch_actions(plugin):
-    lines = plugin.render(_payload(), "/bin/cswap", now=NOW.timestamp())
-    title, headers = lines[0], [l for l in lines[1:] if l[:1].isdigit()]
-
-    assert title.startswith("76% | image=")
-    assert headers[0].startswith("2  john.doe@gmail.com")
-    assert headers[1].startswith("3  john.doe@company.com")
-    # The active account has no action; others switch on click.
-    assert "bash=" not in headers[0] and "● active" in headers[0]
-    assert "bash=/bin/cswap param1=switch param2=3" in headers[1]
-    assert sum("resets 2h 37m" in l for l in lines) == 1
+def test_cards_are_in_number_order_and_others_switch_on_click(plugin):
+    active, other = _cards(_render(plugin))
+    assert active[0].startswith("2  john.doe@gmail.com")
+    assert other[0].startswith(f"{MUTED}3  john.doe@company.com")
+    assert all("refresh=true" in l and "bash=" not in l for l in active)
+    assert all("bash=/bin/cswap param1=switch param2=3" in l for l in other)
 
 
-def test_bar_rows_keep_their_indentation(plugin):
-    lines = plugin.render(_payload(), "/bin/cswap", now=NOW.timestamp())
-    rows = [l for l in lines if l.startswith("   ")]
-    assert len(rows) == 5
-    assert all("trim=false" in row for row in rows)
+def test_active_account_reads_normal_and_others_muted(plugin):
+    active, other = _cards(_render(plugin))
+    text_of = lambda line: line.split(" | ")[0]
+    # Active: email and row labels carry no color code; others are muted.
+    assert "\x1b" not in text_of(active[0]).split("  ")[1]
+    assert text_of(active[1]).startswith("   5h ")
+    assert text_of(other[1]).startswith(f"   {MUTED}5h ")
+    assert f"{MUTED}resets 2h 37m" in text_of(other[1])
+
+
+def test_every_card_line_has_an_action_so_swiftbar_never_greys_it(plugin):
+    for card in _cards(_render(plugin)):
+        for line in card:
+            assert "bash=" in line or "refresh=true" in line
+            assert "trim=false" in line
+
+
+def test_title_follows_settings(plugin):
+    settings = dict(plugin.DEFAULT_SETTINGS, show_account_name=False)
+    title = _render(plugin, settings=settings)[0]
+    assert title.startswith("76% · 13% | image=") and _title_bars(title) == 2
+
+    settings.update(title_scoped=True, title_style="numbers")
+    assert _render(plugin, settings=settings)[0].startswith("76% · 13% · Fable 59% | emojize")
+
+    settings.update(title_pct="5h", title_scoped=False, title_style="bars", show_account_name=True)
+    title = _render(plugin, settings=settings)[0]
+    assert title.startswith("john.doe | image=") and _title_bars(title) == 1
+
+    settings.update(title_pct="off")
+    assert _render(plugin, settings=settings)[0].startswith("john.doe | emojize")
+
+
+def test_settings_menu_marks_current_choices(plugin):
+    lines = _render(plugin, threshold=90.0, auto_on=True)
+    checked = [l.split(" | ")[0].lstrip("-") for l in lines if "checked=true" in l]
+    assert checked == ["Show account name in menu bar", "Both (5h · 7d)", "Bars and numbers",
+                       "60 seconds", "Auto-switch accounts", "90%"]
+    auto = next(l for l in lines if l.startswith("--Auto-switch accounts"))
+    assert 'bash="' + LINK + '" param1=auto param2=off' in auto
+
+
+def test_settings_start_from_cswap_menubar_and_round_trip(plugin):
+    plugin.LEGACY_SETTINGS_PATH.write_text(json.dumps(
+        {"show_account_name": False, "title_pct": "7d", "title_scoped": True, "refresh_interval": 300}
+    ))
+    assert plugin.load_settings() == {
+        "show_account_name": False, "title_pct": "7d", "title_scoped": True, "title_style": "both",
+    }
+    assert plugin.run_action(["set", "title_pct", "5h"], LINK, None) == 0
+    assert plugin.run_action(["set", "show_account_name", "toggle"], LINK, None) == 0
+    assert plugin.run_action(["set", "title_pct", "bogus"], LINK, None) == 2
+    settings = plugin.load_settings()
+    assert settings["title_pct"] == "5h" and settings["show_account_name"] is True
+
+
+def test_interval_renames_the_plugin_link(plugin, tmp_path):
+    link = tmp_path / "cswap.1m.py"
+    link.write_text("")
+    assert plugin.plugin_interval(str(link)) == "1m"
+    assert plugin.run_action(["interval", "30s"], str(link), None) == 0
+    assert not link.exists() and (tmp_path / "cswap.30s.py").exists()
 
 
 def test_passed_reset_rolls_the_window_to_zero(plugin):
     payload = _payload()
     payload["accounts"][1]["usage"]["fiveHour"] = _window(76, -1, "")
-    lines = plugin.render(payload, "/bin/cswap", now=NOW.timestamp())
-    assert lines[0].startswith("59% | image=")
+    settings = dict(plugin.DEFAULT_SETTINGS, show_account_name=False, title_pct="5h")
+    assert _render(plugin, payload, settings=settings)[0].startswith("0% | image=")
 
 
 def test_unavailable_account_falls_back_to_last_known_reading(plugin):
-    payload = _payload()
-    acc = payload["accounts"][0]
+    acc = _payload()["accounts"][0]
     acc.update(
         usageStatus="unavailable",
         usageError="http-429",
@@ -140,5 +232,5 @@ def test_unavailable_account_falls_back_to_last_known_reading(plugin):
 
 
 def test_no_accounts_points_at_cswap_add(plugin):
-    lines = plugin.render({"accounts": []}, "/bin/cswap", now=NOW.timestamp())
-    assert lines == ["cswap", "---", "No managed accounts. Run: cswap add"]
+    lines = _render(plugin, {"accounts": []})
+    assert lines[:3] == ["⇄ | emojize=false symbolize=false", "---", "No managed accounts. Run: cswap add"]
