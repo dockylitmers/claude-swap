@@ -298,7 +298,9 @@ def test_accounts_menu_mirrors_cswap_menubar(plugin, tmp_path, monkeypatch):
     lines = plugin.accounts_menu(payload["accounts"], LINK)
     labels = [l.split(" | ")[0] for l in lines]
     assert labels[:3] == ["Rotate to next", "Switch to best", "Next available"]
-    assert "--From current login" in labels and "--From setup-token…" in labels
+    assert "Add account…" in labels and "Add account with setup-token…" in labels
+    add = next(l for l in lines if l.startswith("Add account…"))
+    assert "param1=login-add terminal=true" in add
     disable = next(l for l in lines if l.startswith("--3  Work  (john.doe@company.com)") and "enable" in l)
     assert "param1=enable param2=3" in disable and "checked=true" in disable
     remove = [l for l in lines if "param1=remove" in l]
@@ -348,3 +350,84 @@ def test_remove_needs_the_dialog_confirmation(plugin, fake_cswap):
     ui["confirm"] = True
     plugin.run_action(["remove", "2", "b@example.com"], LINK, cswap)
     assert calls()[-1] == {"args": ["remove", "2"], "stdin": "y\n"}
+
+
+FAKE_LOGIN_CSWAP = """#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+state_path = Path(__file__).with_name("state.json")
+state = json.loads(state_path.read_text())
+with Path(__file__).with_name("calls.jsonl").open("a") as fh:
+    fh.write(json.dumps(["cswap"] + sys.argv[1:]) + "\\n")
+emails = [a["email"] for a in state["accounts"]]
+live = state["live"]
+if sys.argv[1:] == ["list", "--json"]:
+    print(json.dumps({"accounts": [dict(a, active=a["email"] == live) for a in state["accounts"]]}))
+elif sys.argv[1:] == ["status", "--json"]:
+    number = emails.index(live) + 1 if live in emails else None
+    print(json.dumps({"active": {"number": number, "email": live, "managed": live in emails}}))
+elif sys.argv[1:] == ["add"] and live not in emails:
+    state["accounts"].append({"number": len(emails) + 1, "email": live})
+    state_path.write_text(json.dumps(state))
+"""
+
+FAKE_CLAUDE = """#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+state_path = Path(__file__).with_name("state.json")
+state = json.loads(state_path.read_text())
+with Path(__file__).with_name("calls.jsonl").open("a") as fh:
+    fh.write(json.dumps(["claude"] + sys.argv[1:]) + "\\n")
+if state.get("cancel"):
+    sys.exit(1)
+state["live"] = sys.argv[sys.argv.index("--email") + 1] if "--email" in sys.argv else state["browser"]
+state_path.write_text(json.dumps(state))
+"""
+
+
+@pytest.fixture()
+def login_env(plugin, tmp_path, monkeypatch):
+    for name, body in (("cswap", FAKE_LOGIN_CSWAP), ("claude", FAKE_CLAUDE)):
+        (tmp_path / name).write_text(body)
+        (tmp_path / name).chmod(0o755)
+    state = {"accounts": [{"number": 1, "email": "a@example.com"}], "live": "a@example.com",
+             "browser": "a@example.com"}
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    monkeypatch.setattr(plugin, "find_claude", lambda: str(tmp_path / "claude"))
+    monkeypatch.setattr(plugin, "refresh_swiftbar", lambda: None)
+    answers = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": answers.pop(0) if answers else "")
+
+    def calls():
+        log = tmp_path / "calls.jsonl"
+        return [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+
+    def update(**changes):
+        data = json.loads((tmp_path / "state.json").read_text())
+        data.update(changes)
+        (tmp_path / "state.json").write_text(json.dumps(data))
+
+    return str(tmp_path / "cswap"), answers, calls, update
+
+
+def test_add_account_saves_current_login_signs_in_and_adds(plugin, login_env, capsys):
+    cswap, answers, calls, _update = login_env
+    answers.append("b@example.com")
+    assert plugin.run_action(["login-add"], LINK, cswap) == 0
+    order = [c for c in calls() if c[1:] in (["add"], ["auth", "login", "--email", "b@example.com"])]
+    assert order == [["cswap", "add"], ["claude", "auth", "login", "--email", "b@example.com"], ["cswap", "add"]]
+    assert "Added account 2 (b@example.com)" in capsys.readouterr().out
+
+
+def test_add_account_reports_signing_in_to_an_existing_account(plugin, login_env, capsys):
+    cswap, _answers, _calls, _update = login_env
+    assert plugin.run_action(["login-add"], LINK, cswap) == 1
+    assert "account 1 (a@example.com), which was already added" in capsys.readouterr().out
+
+
+def test_cancelled_login_adds_nothing(plugin, login_env, capsys):
+    cswap, _answers, calls, update = login_env
+    update(cancel=True)
+    assert plugin.run_action(["login-add"], LINK, cswap) == 1
+    assert [c for c in calls() if c == ["cswap", "add"]] == [["cswap", "add"]]  # only the save
+    assert "nothing was added" in capsys.readouterr().out

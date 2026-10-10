@@ -339,6 +339,89 @@ def run_cswap(cswap: str, *args: str, stdin: str | None = None) -> bool:
     return True
 
 
+def find_claude() -> str | None:
+    found = shutil.which("claude")
+    if found:
+        return found
+    for candidate in (
+        Path.home() / ".local/bin/claude",
+        Path.home() / ".claude/local/claude",
+        Path("/opt/homebrew/bin/claude"),
+        Path("/usr/local/bin/claude"),
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def current_login(cswap: str) -> dict | None:
+    """``cswap status --json``'s ``active``: Claude Code's live login, with
+    ``managed`` telling whether claude-swap already holds it."""
+    try:
+        proc = subprocess.run(
+            [cswap, "status", "--json"], input="", capture_output=True, text=True, timeout=30
+        )
+        active = json.loads(proc.stdout).get("active")
+    except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired):
+        return None
+    return active if isinstance(active, dict) else None
+
+
+def refresh_swiftbar() -> None:
+    """Redraw the menu after work done outside a menu click (terminal actions)."""
+    subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshallplugins"], capture_output=True)
+
+
+def login_and_add(cswap: str) -> int:
+    """Add an account by signing in to it. Runs in a terminal window.
+
+    Saves the current login first so it stays switchable, signs in with
+    ``claude auth login`` (which replaces Claude Code's login), then adds
+    the new login with ``cswap add``.
+    """
+    claude = find_claude()
+    if claude is None:
+        print("Claude Code (claude) was not found on PATH. Install it, then try again.")
+        return 1
+    try:
+        known = {a.get("number") for a in load_accounts(cswap).get("accounts") or []}
+    except (RuntimeError, OSError, subprocess.TimeoutExpired):
+        known = set()
+    print("Add an account to claude-swap\n")
+
+    before = current_login(cswap)
+    if before and before.get("managed"):
+        print(f"1/3  Saving the current login (account {before.get('number')}, "
+              f"{before.get('email')}) so you can switch back to it.")
+        subprocess.run([cswap, "add"], input="", text=True)
+    else:
+        print("1/3  No managed login to save.")
+
+    email = input("\n2/3  Email of the account to add (Enter to type it in the browser): ").strip()
+    print("     A browser window opens: sign in with the account you want to add.")
+    print("     If it signs you straight back in to the current account, sign out of claude.ai first.\n")
+    login = [claude, "auth", "login"] + (["--email", email] if email else [])
+    if subprocess.run(login).returncode != 0:
+        print("\nThe login did not finish, so nothing was added.")
+        return 1
+
+    print("\n3/3  Adding the new login to claude-swap.")
+    added = subprocess.run([cswap, "add"], input="", text=True).returncode == 0
+    after = current_login(cswap)
+    refresh_swiftbar()
+    if not added or after is None:
+        print("\nclaude-swap could not add the login. See the message above.")
+        return 1
+    number, email = after.get("number"), after.get("email")
+    if number in known:
+        print(f"\nThat login is account {number} ({email}), which was already added. To add a")
+        print("different account, sign out of claude.ai in the browser and choose Add account again.")
+        return 1
+    print(f"\nAdded account {number} ({email}). Claude Code is now using it;")
+    print("switch accounts from the menu bar at any time. You can close this window.")
+    return 0
+
+
 def notify_switched(cswap: str) -> None:
     try:
         active = next(a for a in load_accounts(cswap)["accounts"] if a.get("active"))
@@ -374,11 +457,16 @@ def account_action(action: str, rest: list[str], cswap: str) -> int | None:
         args = ["switch"] if rest[0] == "rotate" else ["switch", "--strategy", rest[0]]
         if run_cswap(cswap, *args):
             notify_switched(cswap)
-    elif action == "add-login" and not rest:
-        # Adds the account Claude Code is logged in to, or refreshes its stored
-        # credentials when it is already managed.
+    elif action == "login-add" and not rest:
+        return login_and_add(cswap)
+    elif action == "refresh-login" and not rest:
+        # Saves Claude Code's current login: refreshes a managed account's
+        # stored credentials, or adds a login made outside this menu.
+        before = current_login(cswap)
         if run_cswap(cswap, "add"):
-            notify("Current login saved", "Log in to another account in Claude Code and add it the same way.")
+            after = current_login(cswap) or {}
+            verb = "Updated" if before and before.get("managed") else "Added"
+            notify(f"{verb} account {after.get('number')}", str(after.get("email", "")))
     elif action == "add-token" and not rest:
         email = ask("Email for this token:")
         token = email and ask("Setup token (sk-ant-oat01-…):", hidden=True)
@@ -751,10 +839,10 @@ def accounts_menu(accounts: list[dict], plugin_path: str) -> list[str]:
     """cswap menubar's switch strategies, account management and history."""
     lines = [f"{label} | {command(plugin_path, 'switch-strategy', key)}" for key, label in SWITCH_STRATEGIES]
     lines.append("---")
-    lines.append("Add account")
-    lines.append(f"--From current login | {command(plugin_path, 'add-login')}"
-                 ' tooltip="Adds the account Claude Code is logged in to"')
-    lines.append(f"--From setup-token… | {command(plugin_path, 'add-token')}")
+    # Signing in needs a terminal: claude auth login prints its prompts there.
+    lines.append(f"Add account… | bash={_param(plugin_path)} param1=login-add terminal=true"
+                 ' tooltip="Sign in to another Claude account and add it"')
+    lines.append(f"Add account with setup-token… | {command(plugin_path, 'add-token')}")
 
     def account_label(acc: dict) -> str:
         email = clean(acc.get("email", "?"))
@@ -774,7 +862,7 @@ def accounts_menu(accounts: list[dict], plugin_path: str) -> list[str]:
     lines.extend(disable_items or ["--No managed accounts"])
     lines.append("Remove account")
     lines.extend(remove_items or ["--No managed accounts"])
-    lines.append(f"Refresh current credentials | {command(plugin_path, 'add-login')}"
+    lines.append(f"Refresh current credentials | {command(plugin_path, 'refresh-login')}"
                  ' tooltip="Saves the current Claude Code login over its stored copy"')
 
     lines.append("Switch history")
