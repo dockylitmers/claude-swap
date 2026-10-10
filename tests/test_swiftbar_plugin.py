@@ -300,7 +300,7 @@ def test_accounts_menu_mirrors_cswap_menubar(plugin, tmp_path, monkeypatch):
     assert labels[:3] == ["Rotate to next", "Switch to best", "Next available"]
     assert "Add account…" in labels and "Add account with setup-token…" in labels
     add = next(l for l in lines if l.startswith("Add account…"))
-    assert "param1=login-add terminal=true" in add
+    assert "param1=login-add terminal=false refresh=true" in add
     disable = next(l for l in lines if l.startswith("--3  Work  (john.doe@company.com)") and "enable" in l)
     assert "param1=enable param2=3" in disable and "checked=true" in disable
     remove = [l for l in lines if "param1=remove" in l]
@@ -391,12 +391,11 @@ def login_env(plugin, tmp_path, monkeypatch):
         (tmp_path / name).write_text(body)
         (tmp_path / name).chmod(0o755)
     state = {"accounts": [{"number": 1, "email": "a@example.com"}], "live": "a@example.com",
-             "browser": "a@example.com"}
+             "browser": "b@example.com"}
     (tmp_path / "state.json").write_text(json.dumps(state))
     monkeypatch.setattr(plugin, "find_claude", lambda: str(tmp_path / "claude"))
-    monkeypatch.setattr(plugin, "refresh_swiftbar", lambda: None)
-    answers = []
-    monkeypatch.setattr("builtins.input", lambda prompt="": answers.pop(0) if answers else "")
+    alerts = []
+    monkeypatch.setattr(plugin, "alert", lambda msg, warning=True: alerts.append(msg))
 
     def calls():
         log = tmp_path / "calls.jsonl"
@@ -407,27 +406,27 @@ def login_env(plugin, tmp_path, monkeypatch):
         data.update(changes)
         (tmp_path / "state.json").write_text(json.dumps(data))
 
-    return str(tmp_path / "cswap"), answers, calls, update
+    return str(tmp_path / "cswap"), alerts, calls, update
 
 
-def test_add_account_saves_current_login_signs_in_and_adds(plugin, login_env, capsys):
-    cswap, answers, calls, _update = login_env
-    answers.append("b@example.com")
+def test_add_account_saves_current_login_signs_in_and_adds(plugin, login_env):
+    cswap, alerts, calls, _update = login_env
     assert plugin.run_action(["login-add"], LINK, cswap) == 0
-    order = [c for c in calls() if c[1:] in (["add"], ["auth", "login", "--email", "b@example.com"])]
-    assert order == [["cswap", "add"], ["claude", "auth", "login", "--email", "b@example.com"], ["cswap", "add"]]
-    assert "Added account 2 (b@example.com)" in capsys.readouterr().out
+    order = [c for c in calls() if c[1:] in (["add"], ["auth", "login", "--claudeai"])]
+    assert order == [["cswap", "add"], ["claude", "auth", "login", "--claudeai"], ["cswap", "add"]]
+    assert alerts == [alerts[0]] and alerts[0].startswith("Added account 2 (b@example.com)")
 
 
-def test_add_account_reports_signing_in_to_an_existing_account(plugin, login_env, capsys):
-    cswap, _answers, _calls, _update = login_env
+def test_add_account_reports_signing_in_to_an_existing_account(plugin, login_env):
+    cswap, alerts, _calls, update = login_env
+    update(browser="a@example.com")
     assert plugin.run_action(["login-add"], LINK, cswap) == 1
-    assert "account 1 (a@example.com), which was already added" in capsys.readouterr().out
+    assert "account 1 (a@example.com), which was already added" in alerts[0]
 
 
-def test_cancelled_login_adds_nothing(plugin, login_env, capsys):
-    cswap, _answers, calls, update = login_env
+def test_cancelled_login_adds_nothing(plugin, login_env):
+    cswap, alerts, calls, update = login_env
     update(cancel=True)
     assert plugin.run_action(["login-add"], LINK, cswap) == 1
     assert [c for c in calls() if c == ["cswap", "add"]] == [["cswap", "add"]]  # only the save
-    assert "nothing was added" in capsys.readouterr().out
+    assert alerts == ["The sign-in did not finish, so no account was added."]
