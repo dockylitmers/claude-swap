@@ -25,6 +25,18 @@ uv sync
 uv run cswap help
 ```
 
+### macOS menu bar (SwiftBar)
+
+To install cswap from a clone together with [SwiftBar](https://swiftbar.app/) and its usage-bar plugin, opening at login:
+
+```bash
+git clone https://github.com/dockylitmers/claude-swap.git
+cd claude-swap
+contrib/swiftbar/install.sh
+```
+
+See [contrib/swiftbar](contrib/swiftbar/README.md) for options.
+
 ### Updating
 
 ```bash

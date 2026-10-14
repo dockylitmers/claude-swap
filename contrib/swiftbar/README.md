@@ -20,6 +20,24 @@ The plugin only drives the `cswap` command line. It needs no packages beyond the
 
 ## Install
 
+From the repository root:
+
+```bash
+contrib/swiftbar/install.sh
+```
+
+It installs `cswap` from this checkout (`uv tool install --editable`, so a `git pull` updates it), installs SwiftBar with Homebrew if it is missing, links the plugin into SwiftBar's plugin folder (keeping one you already chose), removes the `cswap menubar` launchd service if you had it, adds SwiftBar to your login items so it opens at login, and starts SwiftBar. It is safe to re-run.
+
+| Option | What it does |
+|---|---|
+| `--no-login-item` | Leave login items alone |
+| `--skip-cswap` | Don't (re)install `cswap` |
+
+SwiftBar's own *Launch at login* switch can only be flipped from inside the app, so the script registers SwiftBar under System Settings → General → Login Items instead. The first run may ask to let your terminal control System Events.
+
+<details>
+<summary>Manual install</summary>
+
 ```bash
 brew install --cask swiftbar
 mkdir -p ~/Library/Application\ Support/SwiftBar/Plugins
@@ -29,6 +47,8 @@ open -a SwiftBar
 ```
 
 Run the commands from the repository root. If you used `cswap menubar --install-service`, remove it with `cswap menubar --uninstall-service` so you don't get two status items.
+
+</details>
 
 The plugin finds `cswap` on `PATH`, then in `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`. Set `CSWAP_BIN` to point it elsewhere.
 
