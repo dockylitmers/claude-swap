@@ -163,8 +163,13 @@ def test_every_card_line_has_an_action_so_swiftbar_never_greys_it(plugin):
             assert "trim=false" in line
 
 
+def test_default_title_is_bars_numbers_and_reset_times(plugin):
+    title = _render(plugin)[0]
+    assert title.startswith("76% 2h47m · 13% 5d0h | image=") and _title_bars(title) == 2
+
+
 def test_title_follows_settings(plugin):
-    settings = dict(plugin.DEFAULT_SETTINGS, show_account_name=False)
+    settings = dict(plugin.DEFAULT_SETTINGS, title_reset=False)
     title = _render(plugin, settings=settings)[0]
     assert title.startswith("76% · 13% | image=") and _title_bars(title) == 2
 
@@ -188,15 +193,66 @@ def test_title_can_show_reset_times(plugin):
     assert _render(plugin, settings=settings)[0].startswith("2h47m · Fable 5d3h | image=")
 
 
+CONFIG = {"autoswitch.threshold": 90.0, "autoswitch.weeklyThreshold": None}
+
+
 def test_settings_menu_marks_current_choices(plugin):
-    lines = _render(plugin, threshold=90.0, auto_on=True)
+    lines = _render(plugin, config=CONFIG, auto_on=True)
     checked = [l.split(" | ")[0].lstrip("-") for l in lines if "checked=true" in l]
-    assert checked == ["Show account name in menu bar", "Session (5h)", "Weekly (7d)",
-                       "Bars and numbers", "60 seconds", "Auto-switch accounts", "90%"]
-    auto = next(l for l in lines if l.startswith("--Auto-switch accounts"))
-    assert 'bash="' + LINK + '" param1=auto param2=off' in auto
+    assert checked == ["Auto-switch accounts", "Session (5h)", "Weekly (7d)",
+                       "Bars and numbers", "Show reset time", "60 seconds", "90%", "Same as threshold"]
     # Inside a level-2 submenu, a separator needs two "--" prefixes.
     assert "-------" in lines
+
+
+def test_weekly_switch_line_sets_and_clears_cswaps_setting(plugin, monkeypatch):
+    lines = _render(plugin, config=dict(CONFIG, **{"autoswitch.weeklyThreshold": 99.9}))
+    weekly = {l.split(" | ")[0]: l for l in lines if "param1=weekly" in l}
+    assert list(weekly) == ["----Same as threshold", "----95%", "----97%", "----99%", "----99.9%"]
+    assert "checked=true" in weekly["----99.9%"] and "param2=99.9" in weekly["----99.9%"]
+    assert "param2=off" in weekly["----Same as threshold"]
+    # A cswap without the weekly line gets no submenu.
+    assert not any("param1=weekly" in l for l in _render(plugin, config={"autoswitch.threshold": 90.0}))
+
+    calls = []
+    monkeypatch.setattr(plugin, "set_threshold", lambda cswap, key, pct: calls.append((key, pct)))
+    assert plugin.run_action(["weekly", "99.9"], LINK, "/bin/cswap") == 0
+    assert plugin.run_action(["weekly", "off"], LINK, "/bin/cswap") == 0
+    assert plugin.run_action(["threshold", "95"], LINK, "/bin/cswap") == 0
+    assert plugin.run_action(["weekly", "42"], LINK, "/bin/cswap") == 2
+    assert calls == [("autoswitch.weeklyThreshold", "99.9"), ("autoswitch.weeklyThreshold", None),
+                     ("autoswitch.threshold", "95")]
+
+
+def test_auto_switch_toggle_sits_in_the_main_menu(plugin):
+    lines = _render(plugin, auto_on=True)
+    auto = [l for l in lines if "param1=auto " in l]
+    assert len(auto) == 1 and auto[0].startswith("Auto-switch accounts | ")
+    assert 'bash="' + LINK + '" param1=auto param2=off' in auto[0]
+    off = next(l for l in _render(plugin, auto_on=False) if "param1=auto " in l)
+    assert "param2=on" in off and "checked=true" not in off
+
+
+def test_auto_switch_is_on_until_the_menu_turns_it_off(plugin, monkeypatch):
+    agent = {"on": False, "enabled": 0}
+
+    def enable(cswap):
+        agent.update(on=True, enabled=agent["enabled"] + 1)
+
+    monkeypatch.setattr(plugin, "auto_enabled", lambda: agent["on"])
+    monkeypatch.setattr(plugin, "enable_auto", enable)
+    monkeypatch.setattr(plugin, "disable_auto", lambda: agent.update(on=False))
+
+    assert plugin.ensure_auto(plugin.load_settings(), "/bin/cswap") is True
+    assert agent["enabled"] == 1
+
+    assert plugin.run_action(["auto", "off"], LINK, "/bin/cswap") == 0
+    assert agent["on"] is False and plugin.load_settings()["auto_switch"] is False
+    assert plugin.ensure_auto(plugin.load_settings(), "/bin/cswap") is False
+    assert agent["enabled"] == 1
+
+    assert plugin.run_action(["auto", "on"], LINK, "/bin/cswap") == 0
+    assert agent["on"] is True and plugin.load_settings()["auto_switch"] is True
 
 
 def test_limit_items_toggle_one_limit_each(plugin):
@@ -216,13 +272,13 @@ def test_settings_start_from_cswap_menubar_and_round_trip(plugin):
     ))
     assert plugin.load_settings() == {
         "show_account_name": False, "title_limits": ["7d", "models"],
-        "title_style": "both", "title_reset": False,
+        "title_style": "both", "title_reset": True, "auto_switch": True,
     }
     assert plugin.run_action(["set", "title_limits", "5h"], LINK, None) == 0
     assert plugin.run_action(["set", "title_reset", "toggle"], LINK, None) == 0
     assert plugin.run_action(["set", "title_style", "bogus"], LINK, None) == 2
     settings = plugin.load_settings()
-    assert settings["title_limits"] == ["5h"] and settings["title_reset"] is True
+    assert settings["title_limits"] == ["5h"] and settings["title_reset"] is False
     assert plugin.run_action(["set", "title_limits", "none"], LINK, None) == 0
     assert plugin.load_settings()["title_limits"] == []
 
@@ -297,15 +353,16 @@ def test_accounts_menu_mirrors_cswap_menubar(plugin, tmp_path, monkeypatch):
     payload["accounts"][0]["disabled"] = True
     lines = plugin.accounts_menu(payload["accounts"], LINK)
     labels = [l.split(" | ")[0] for l in lines]
-    assert labels[:3] == ["Rotate to next", "Switch to best", "Next available"]
-    assert "Add account…" in labels and "Add account with setup-token…" in labels
-    add = next(l for l in lines if l.startswith("Add account…"))
-    assert "param1=login-add terminal=false refresh=true" in add
-    disable = next(l for l in lines if l.startswith("--3  Work  (john.doe@company.com)") and "enable" in l)
+    # Only Add account… stays outside the Accounts submenu.
+    assert labels[:5] == ["Add account…", "Accounts", "--Rotate to next", "--Switch to best", "--Next available"]
+    assert all(l.startswith("--") for l in labels[2:])
+    assert "--Add account with setup-token…" in labels
+    assert "param1=login-add terminal=false refresh=true" in lines[0]
+    disable = next(l for l in lines if l.startswith("----3  Work  (john.doe@company.com)") and "enable" in l)
     assert "param1=enable param2=3" in disable and "checked=true" in disable
     remove = [l for l in lines if "param1=remove" in l]
     assert "param2=3 param3=john.doe@company.com" in remove[0]
-    assert "--No switches logged yet" in labels
+    assert "----No switches logged yet" in labels
 
 
 def test_switch_history_reads_newest_first(plugin, tmp_path):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <xbar.title>claude-swap usage</xbar.title>
-# <xbar.version>v1.1</xbar.version>
+# <xbar.version>v1.2</xbar.version>
 # <xbar.author>dockylitmers</xbar.author>
 # <xbar.desc>Usage bars for every claude-swap account. Click an account to switch to it.</xbar.desc>
 # <xbar.dependencies>python3,claude-swap</xbar.dependencies>
@@ -13,10 +13,12 @@
 The title draws the active account's windows as stacked mini bars with
 their percentages. The dropdown lists every managed account with full bars
 and reset countdowns, like ``cswap watch``; clicking another account
-switches to it. The rest mirrors ``cswap menubar``: switch strategies,
-adding, disabling and removing accounts, switch history, and Settings for
-what the title shows, the refresh interval, and the auto-switcher
-(``cswap auto``, kept running by a launchd agent).
+switches to it. Below them sit the auto-switcher toggle (``cswap auto``,
+kept running by a launchd agent; on by default), Add account, and an
+Accounts submenu with the rest of ``cswap menubar``'s account menu: switch
+strategies, disabling and removing accounts, and switch history. Settings
+covers what the title shows, the refresh interval and the auto-switch
+lines (``autoswitch.threshold`` and ``autoswitch.weeklyThreshold``).
 
 It only drives the ``cswap`` command line, so it needs nothing beyond the
 Python standard library and runs on the macOS system ``python3`` (3.9).
@@ -70,13 +72,17 @@ TITLE = "emojize=false symbolize=false"
 TITLE_STYLE_CHOICES = (("both", "Bars and numbers"), ("bars", "Bars only"), ("numbers", "Numbers only"))
 REFRESH_CHOICES = (("30s", "30 seconds"), ("1m", "60 seconds"), ("5m", "5 minutes"))
 AUTO_THRESHOLD_CHOICES = (80, 90, 95, 98)
+WEEKLY_THRESHOLD_CHOICES = (95, 97, 99, 99.9)
+THRESHOLD_KEY = "autoswitch.threshold"
+WEEKLY_THRESHOLD_KEY = "autoswitch.weeklyThreshold"  # cswap 0.29+; None while unset
 ACCOUNT_LIMITS = (("5h", "Session (5h)"), ("7d", "Weekly (7d)"))
 ALL_MODELS = "models"
 DEFAULT_SETTINGS = {
-    "show_account_name": True,
+    "show_account_name": False,
     "title_limits": ["5h", "7d"],
     "title_style": "both",
-    "title_reset": False,
+    "title_reset": True,
+    "auto_switch": True,
 }
 _CHOICES = {"title_style": TITLE_STYLE_CHOICES}
 _TOGGLES = ("show_account_name", "title_reset")
@@ -209,15 +215,17 @@ def set_plugin_interval(plugin_path: str, interval: str) -> None:
         os.rename(path, target)  # SwiftBar reloads the renamed plugin
 
 
-def read_threshold(cswap: str) -> float | None:
+def read_config(cswap: str) -> dict:
+    """cswap's effective settings by key (``autoswitch.threshold``: 90.0, …);
+    empty when cswap cannot say."""
     try:
         proc = subprocess.run(
-            [cswap, "config", "get", "autoswitch.threshold"],
-            capture_output=True, text=True, timeout=15,
+            [cswap, "config", "--json", "list"], capture_output=True, text=True, timeout=15
         )
-        return float(proc.stdout.strip())
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
+        rows = json.loads(proc.stdout).get("settings") or []
+    except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired):
+        return {}
+    return {r["key"]: r.get("value") for r in rows if isinstance(r, dict) and isinstance(r.get("key"), str)}
 
 
 def auto_enabled() -> bool:
@@ -264,11 +272,24 @@ def disable_auto() -> None:
         AUTO_PLIST.unlink()
 
 
-def set_threshold(cswap: str, pct: int) -> None:
-    subprocess.run(
-        [cswap, "config", "set", "autoswitch.threshold", str(pct)],
-        capture_output=True, check=True, timeout=15,
-    )
+def ensure_auto(settings: dict, cswap: str) -> bool:
+    """Whether the auto-switcher runs. It is on by default: the agent is
+    installed unless the menu turned it off (``auto_switch`` false)."""
+    if auto_enabled():
+        return True
+    if not settings["auto_switch"]:
+        return False
+    try:
+        enable_auto(cswap)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
+def set_threshold(cswap: str, key: str, pct: str | None) -> None:
+    """Set an auto-switch line, or unset it when ``pct`` is None."""
+    args = ["set", key, pct] if pct is not None else ["unset", key]
+    subprocess.run([cswap, "config", *args], capture_output=True, check=True, timeout=15)
     if auto_enabled():
         # cswap auto reads its settings once at start.
         subprocess.run(
@@ -485,7 +506,7 @@ def account_action(action: str, rest: list[str], cswap: str) -> int | None:
 
 def run_action(args: list[str], plugin_path: str, cswap: str | None) -> int:
     """Handle a menu click: settings (``set``, ``interval``, ``auto``,
-    ``threshold``) or an account action (see ``account_action``)."""
+    ``threshold``, ``weekly``) or an account action (see ``account_action``)."""
     action, rest = args[0], args[1:]
     if cswap is not None:
         handled = account_action(action, rest, cswap)
@@ -507,9 +528,15 @@ def run_action(args: list[str], plugin_path: str, cswap: str | None) -> int:
     elif action == "interval" and len(rest) == 1 and rest[0] in dict(REFRESH_CHOICES):
         set_plugin_interval(plugin_path, rest[0])
     elif action == "auto" and rest in (["on"], ["off"]) and cswap:
-        enable_auto(cswap) if rest[0] == "on" else disable_auto()
-    elif action == "threshold" and len(rest) == 1 and rest[0].isdigit() and cswap:
-        set_threshold(cswap, int(rest[0]))
+        # Record the choice first, so a turned-off switcher stays off.
+        settings = load_settings()
+        settings["auto_switch"] = rest[0] == "on"
+        save_settings(settings)
+        enable_auto(cswap) if settings["auto_switch"] else disable_auto()
+    elif action == "threshold" and rest in [[f"{p:g}"] for p in AUTO_THRESHOLD_CHOICES] and cswap:
+        set_threshold(cswap, THRESHOLD_KEY, rest[0])
+    elif action == "weekly" and rest in [["off"]] + [[f"{p:g}"] for p in WEEKLY_THRESHOLD_CHOICES] and cswap:
+        set_threshold(cswap, WEEKLY_THRESHOLD_KEY, None if rest[0] == "off" else rest[0])
     else:
         return 2
     return 0
@@ -792,9 +819,7 @@ def account_card(acc: dict, plugin_path: str, track: int, now: float) -> list[st
     return lines
 
 
-def settings_menu(
-    settings: dict, plugin_path: str, threshold: float | None, auto_on: bool, models: list[str]
-) -> list[str]:
+def settings_menu(settings: dict, plugin_path: str, config: dict, models: list[str]) -> list[str]:
     def item(label: str, checked: bool, *args: object, depth: int = 1, refresh: bool = True) -> str:
         mark = " checked=true" if checked else ""
         return f"{'--' * depth}{label} | {command(plugin_path, *args, refresh=refresh)}{mark}"
@@ -824,20 +849,30 @@ def settings_menu(
     for value, label in REFRESH_CHOICES:
         # No refresh: the rename makes SwiftBar reload the plugin anyway.
         lines.append(item(label, interval == value, "interval", value, depth=2, refresh=False))
-    lines.append(item("Auto-switch accounts", auto_on, "auto", "off" if auto_on else "on"))
     lines.append("--Auto-switch threshold")
     for pct in AUTO_THRESHOLD_CHOICES:
-        lines.append(item(f"{pct}%", threshold == pct, "threshold", pct, depth=2))
+        lines.append(item(f"{pct:g}%", config.get(THRESHOLD_KEY) == pct, "threshold", f"{pct:g}", depth=2))
+    if WEEKLY_THRESHOLD_KEY in config:
+        # The 7d and per-model windows' own line; unset, the threshold above
+        # governs them too.
+        weekly = config[WEEKLY_THRESHOLD_KEY]
+        lines.append("--Weekly switch line")
+        lines.append(item("Same as threshold", weekly is None, "weekly", "off", depth=2))
+        lines.append("-------")
+        for pct in WEEKLY_THRESHOLD_CHOICES:
+            lines.append(item(f"{pct:g}%", weekly == pct, "weekly", f"{pct:g}", depth=2))
     return lines
 
 
 def accounts_menu(accounts: list[dict], plugin_path: str) -> list[str]:
-    """cswap menubar's switch strategies, account management and history."""
-    lines = [f"{label} | {command(plugin_path, 'switch-strategy', key)}" for key, label in SWITCH_STRATEGIES]
-    lines.append("---")
-    lines.append(f"Add account… | {command(plugin_path, 'login-add')}"
-                 ' tooltip="Sign in to another Claude account in your browser and add it"')
-    lines.append(f"Add account with setup-token… | {command(plugin_path, 'add-token')}")
+    """Add account…, then cswap menubar's switch strategies, account
+    management and history in one Accounts submenu."""
+    lines = [f"Add account… | {command(plugin_path, 'login-add')}"
+             ' tooltip="Sign in to another Claude account in your browser and add it"',
+             "Accounts"]
+    lines.extend(f"--{label} | {command(plugin_path, 'switch-strategy', key)}" for key, label in SWITCH_STRATEGIES)
+    lines.append("-----")
+    lines.append(f"--Add account with setup-token… | {command(plugin_path, 'add-token')}")
 
     def account_label(acc: dict) -> str:
         email = clean(acc.get("email", "?"))
@@ -850,23 +885,24 @@ def accounts_menu(accounts: list[dict], plugin_path: str) -> list[str]:
         # A check mark means held out of auto-rotation, as in cswap menubar.
         disabled = bool(acc.get("disabled"))
         toggle = command(plugin_path, "enable" if disabled else "disable", acc["number"])
-        disable_items.append(f"--{account_label(acc)} | {toggle}" + (" checked=true" if disabled else ""))
+        disable_items.append(f"----{account_label(acc)} | {toggle}" + (" checked=true" if disabled else ""))
         remove = command(plugin_path, "remove", acc["number"], clean(acc.get("email", "?")))
-        remove_items.append(f"--{account_label(acc)} | {remove}")
-    lines.append("Disable / enable account")
-    lines.extend(disable_items or ["--No managed accounts"])
-    lines.append("Remove account")
-    lines.extend(remove_items or ["--No managed accounts"])
-    lines.append(f"Refresh current credentials | {command(plugin_path, 'refresh-login')}"
+        remove_items.append(f"----{account_label(acc)} | {remove}")
+    lines.append("--Disable / enable account")
+    lines.extend(disable_items or ["----No managed accounts"])
+    lines.append("--Remove account")
+    lines.extend(remove_items or ["----No managed accounts"])
+    lines.append(f"--Refresh current credentials | {command(plugin_path, 'refresh-login')}"
                  ' tooltip="Saves the current Claude Code login over its stored copy"')
 
-    lines.append("Switch history")
-    history = switch_history()
-    lines.extend(f"--{entry}" for entry in history)
-    if not history:
-        lines.append("--No switches logged yet")
     lines.append("-----")
-    lines.append(f"--Open full log… | {command(plugin_path, 'open-log', refresh=False)}")
+    lines.append("--Switch history")
+    history = switch_history()
+    lines.extend(f"----{entry}" for entry in history)
+    if not history:
+        lines.append("----No switches logged yet")
+    lines.append("-------")
+    lines.append(f"----Open full log… | {command(plugin_path, 'open-log', refresh=False)}")
     return lines
 
 
@@ -875,7 +911,7 @@ def render(
     cswap: str,
     plugin_path: str,
     settings: dict | None = None,
-    threshold: float | None = None,
+    config: dict | None = None,
     auto_on: bool = False,
     appearance: str = "Dark",
     now: float | None = None,
@@ -894,10 +930,12 @@ def render(
             lines.append("---")
             lines.extend(account_card(acc, plugin_path, track, now))
     lines.append("---")
+    lines.append(f"Auto-switch accounts | {command(plugin_path, 'auto', 'off' if auto_on else 'on')}"
+                 + (" checked=true" if auto_on else ""))
     lines.extend(accounts_menu(accounts, plugin_path))
     lines.append("---")
     models = model_names(accounts, settings["title_limits"])
-    lines.extend(settings_menu(settings, plugin_path, threshold, auto_on, models))
+    lines.extend(settings_menu(settings, plugin_path, config or {}, models))
     lines.append(f"Open live dashboard (cswap watch) | bash={_param(cswap)} param1=watch terminal=true")
     return lines
 
@@ -917,13 +955,14 @@ def main(argv: list[str]) -> int:
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         print(f"{ICON} !\n---\n{clean(exc)} | {ROW} refresh=true")
         return 0
+    settings = load_settings()
     lines = render(
         payload,
         cswap,
         plugin_path,
-        settings=load_settings(),
-        threshold=read_threshold(cswap),
-        auto_on=auto_enabled(),
+        settings=settings,
+        config=read_config(cswap),
+        auto_on=ensure_auto(settings, cswap),
         appearance=os.environ.get("OS_APPEARANCE", "Dark"),
     )
     print("\n".join(lines))
