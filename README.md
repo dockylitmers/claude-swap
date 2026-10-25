@@ -1,5 +1,8 @@
 # claude-swap
 
+<p><img src="assets/swiftbar-menubar.png" width="177" alt="Menu bar: the active account's 5h and 7d usage as two bars, with percentages and reset times (25% 59m · 58% 4d12h)"></p>
+<p><img src="assets/swiftbar-dropdown.png" width="462" alt="Menu bar dropdown: every account's 5h, 7d and Fable usage bars with reset times, and a switch action for each"></p>
+
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
 ## Installation
